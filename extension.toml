@@ -4,7 +4,7 @@ version = "0.0.1"
 schema_version = 1
 authors = ["Vadim Suharnikov"]
 description = "Mojo language support for Zed"
-repository = "https://github.com/vadim-su/zed_mojo"
+repository = "https://github.com/sstadick/zed_mojo"
 snippets = ["./snippets/mojo.json"]
 
 [grammars.mojo]
