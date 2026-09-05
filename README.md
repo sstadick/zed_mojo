@@ -82,7 +82,11 @@ When Mojo reports an unknown declaration, open Zed's code-actions menu on the un
 
 The import index searches the worktree, stdlib sources, `-I` directories, Mojo's configured import paths, `MOJO_IMPORT_PATH`, and the selected compiler's `lib/mojo` directory. Source packages include public declarations and re-exports; compiled packages are indexed with the matching `mojo doc` command and cached. Packages must already be installed or available on an import path.
 
-Compiler documentation metadata omits compiled-package re-exports. For known symbols, the extension checks whether parent-package imports compile and ranks confirmed shorter paths first (for example, `mojo_raylib` before `mojo_raylib.raw.types`). Checks resolve imports without running or linking package code, are cached until indexed files change, and have a two-second budget per symbol; unchecked paths can be retried on the next request. Renamed compiled-only exports absent from metadata and dynamically generated or conditional source exports may not be discovered.
+Compiler documentation metadata omits compiled-package re-exports. The extension checks parent-package imports in batches and ranks confirmed shorter paths first (for example, `mojo_raylib` before `mojo_raylib.raw.types`). These checks resolve imports without running or linking package code. The results persist across language-server restarts and are invalidated when installed package artifacts, compiler, or import-path configuration change. Editing an unrelated project file does not rerun successful package-wide checks.
+
+The automatically downloaded stdlib checkout is treated as immutable: its symbol index is built once per pinned checkout and saved to disk. Subsequent lookups do not walk or parse that tree. Explicit `stdlib_path` checkouts remain editable and are checked for changes, like project sources. Mutable import paths are checked at most once every two seconds; unchanged files do not rebuild the index.
+
+The first lookup can include indexing and compiler work. Package-wide re-export checking has a ten-second budget per package; unsupported/incomplete compiler diagnostics fall back to bounded per-symbol checks (two seconds per lookup). Renamed compiled-only exports absent from metadata and dynamically generated or conditional source exports may not be discovered. Warm-cache performance therefore depends on whether package-wide indexing completed successfully.
 
 ### Source and bridge settings
 

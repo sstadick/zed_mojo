@@ -102,6 +102,124 @@ from .impl import (
 
 
 class IndexTests(unittest.TestCase):
+    def test_immutable_stdlib_is_reused_without_scanning_across_restarts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stdlib, project = root / "stdlib", root / "project"
+            (stdlib / "std/math").mkdir(parents=True)
+            project.mkdir()
+            (stdlib / "std/math/__init__.mojo").write_text("from .impl import *\n")
+            (stdlib / "std/math/impl.mojo").write_text(
+                "def square(x: Int) -> Int:\n    return x * x\n"
+            )
+            index = bridge.ImportIndex(
+                [stdlib, project],
+                root / "no-compiler",
+                root / "cache",
+                immutable_roots={stdlib: "release-tag"},
+            )
+            self.assertEqual(index.candidates("square"), ["std.math", "std.math.impl"])
+            original = bridge.module_files
+
+            def scan(path):
+                self.assertEqual(path, project, "cached stdlib must not be walked")
+                return original(path)
+
+            with patch.object(bridge, "module_files", side_effect=scan):
+                index.updated = 0
+                with patch.object(
+                    bridge, "resolve_reexports", side_effect=AssertionError("no rebuild")
+                ):
+                    self.assertEqual(index.candidates("square"), ["std.math", "std.math.impl"])
+                (project / "local.mojo").write_text("from std.math import square as local_square\n")
+                index.updated = 0
+                self.assertEqual(index.candidates("local_square"), ["local"])
+                restarted = bridge.ImportIndex(
+                    [stdlib, project],
+                    root / "no-compiler",
+                    root / "cache",
+                    immutable_roots={stdlib: "release-tag"},
+                )
+                self.assertEqual(restarted.candidates("square"), ["std.math", "std.math.impl"])
+            # A different release is indexed afresh, as is a corrupt snapshot.
+            for cached in (root / "cache").glob("stdlib-*.json"):
+                cached.write_text('{"std.math": 42}')
+            restarted = bridge.ImportIndex(
+                [stdlib],
+                root / "no-compiler",
+                root / "cache",
+                immutable_roots={stdlib: "release-tag"},
+            )
+            self.assertEqual(restarted.candidates("square"), ["std.math", "std.math.impl"])
+
+    def test_batch_probe_rejects_incomplete_or_unrelated_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            index = bridge.ImportIndex([root], Path(sys.executable), root / "cache")
+
+            def error(line, symbol, message=None):
+                return json.dumps(
+                    {
+                        "kind": "error",
+                        "message": message or f"package 'pkg' does not contain '{symbol}'",
+                        "diagnostic": {
+                            "file": str(root / "imports.mojo"),
+                            "location": {"line": line},
+                        },
+                    }
+                )
+
+            sentinel = error(3, "_zed_mojo_probe_end_7c42b0a1")
+            cases = [
+                (error(2, "Hidden") + "\n" + sentinel, {"Public"}),
+                (sentinel, {"Public", "Hidden"}),
+                (error(2, "Hidden"), None),
+                (error(1, "Public", "unexpected parser failure") + "\n" + sentinel, None),
+                ("{malformed json", None),
+            ]
+            for stderr, expected in cases:
+                with self.subTest(stderr=stderr), patch.object(
+                    subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", stderr)
+                ):
+                    self.assertEqual(
+                        index.probe_imports("pkg", ["Public", "Hidden"], root), expected
+                    )
+
+    def test_compiled_surfaces_persist_without_per_symbol_probes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "pkg.mojoc"
+            package.touch()
+            doc = {
+                "decl": {
+                    "modules": [
+                        {"name": "__init__"},
+                        {"name": "impl", "aliases": [{"name": "Public"}, {"name": "Hidden"}]},
+                    ]
+                }
+            }
+
+            def compile_docs(args, **kwargs):
+                Path(args[args.index("-o") + 1]).write_text(json.dumps(doc))
+                return subprocess.CompletedProcess(args, 0)
+
+            for restart in (False, True):
+                index = bridge.ImportIndex([root], Path(sys.executable), root / ".cache")
+                with patch.object(subprocess, "run", side_effect=compile_docs) as run, patch.object(
+                    index, "probe_imports", return_value={"Public"}
+                ) as batch, patch.object(
+                    index, "verified_reexport", side_effect=AssertionError("no per-symbol compiler")
+                ):
+                    self.assertEqual(index.candidates("Public"), ["pkg", "pkg.impl"])
+                    self.assertEqual(index.candidates("Hidden"), ["pkg.impl"])
+                    (root / "main.mojo").write_text(
+                        "def main():\n    pass\n" + ("# edit\n" if restart else "")
+                    )
+                    index.updated = 0
+                    self.assertEqual(index.candidates("Public"), ["pkg", "pkg.impl"])
+                    self.assertEqual(run.call_count, 0 if restart else 1)
+                    self.assertEqual(batch.call_count, 0 if restart else 1)
+
     def test_source_packages_reexports_and_removed_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
