@@ -80,7 +80,9 @@ An existing stdlib source directory on your import path is used before downloadi
 
 When Mojo reports an unknown declaration, open Zed's code-actions menu on the underlined symbol and choose **Import `<symbol>` from `<module>`**. For example, `sqrt(1.0)` offers `from std.math import sqrt`. The edit inserts an import while preserving the file's header, module docstring, existing imports, and line endings. Existing Mojo quick fixes remain available.
 
-The import index searches the worktree, stdlib sources, `-I` directories, Mojo's configured import paths, `MOJO_IMPORT_PATH`, and the selected compiler's `lib/mojo` directory. Source packages include public declarations and re-exports; compiled packages are indexed with the matching `mojo doc` command and cached. Packages must already be installed or available on an import path. A compiled package may offer its defining submodule instead of a top-level re-export. Dynamically generated or conditional exports may not be discovered.
+The import index searches the worktree, stdlib sources, `-I` directories, Mojo's configured import paths, `MOJO_IMPORT_PATH`, and the selected compiler's `lib/mojo` directory. Source packages include public declarations and re-exports; compiled packages are indexed with the matching `mojo doc` command and cached. Packages must already be installed or available on an import path.
+
+Compiler documentation metadata omits compiled-package re-exports. For known symbols, the extension checks whether parent-package imports compile and ranks confirmed shorter paths first (for example, `mojo_raylib` before `mojo_raylib.raw.types`). Checks resolve imports without running or linking package code, are cached until indexed files change, and have a two-second budget per symbol; unchecked paths can be retried on the next request. Renamed compiled-only exports absent from metadata and dynamically generated or conditional source exports may not be discovered.
 
 ### Source and bridge settings
 

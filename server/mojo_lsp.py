@@ -369,10 +369,16 @@ def doc_exports(declaration, module):
         yield from doc_exports(child, child_module)
 
 
+def import_rank(module):
+    return module.count("."), module
+
+
 class ImportIndex:
-    def __init__(self, roots, compiler, cache):
+    def __init__(self, roots, compiler, cache, environment=None):
         self.roots, self.compiler, self.cache = roots, compiler, cache
+        self.environment = environment
         self.parsed, self.symbols = {}, {}
+        self.compiled_modules, self.reexports = set(), {}
         self.updated = 0
 
     def compiled_exports(self, path, module):
@@ -401,7 +407,7 @@ class ImportIndex:
             args = [str(self.compiler), "doc", str(path), "-o", str(output)]
             for root in self.roots:
                 args.extend(["-I", str(root)])
-            subprocess.run(args, capture_output=True, timeout=30, check=True)
+            subprocess.run(args, capture_output=True, timeout=30, check=True, env=self.environment)
             document = json.loads(output.read_text())
             exports = {}
             for name, symbols in doc_exports(document["decl"], module):
@@ -411,10 +417,44 @@ class ImportIndex:
             os.replace(staging, cached)
             return exports
 
+    def verified_reexport(self, module, symbol, timeout):
+        """Docs omit compiled imports. Ask the compiler instead of assuming a re-export."""
+        key = (module, symbol)
+        if key in self.reexports:
+            return self.reexports[key]
+        if not self.compiler.is_file():
+            return False
+        try:
+            self.cache.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="import-probe-", dir=self.cache) as temporary:
+                source = Path(temporary) / "probe.mojo"
+                source.write_text(f"from {module} import {symbol}\n", encoding="utf-8")
+                args = [
+                    str(self.compiler),
+                    "doc",
+                    str(source),
+                    "-o",
+                    str(Path(temporary) / "doc.json"),
+                ]
+                for root in self.roots:
+                    args.extend(["-I", str(root)])
+                # Parse/resolve only: no package code is executed or linked.
+                result = subprocess.run(
+                    args, capture_output=True, timeout=timeout, env=self.environment
+                )
+                self.reexports[key] = result.returncode == 0
+        except (OSError, subprocess.SubprocessError) as error:
+            # Transient failures must not poison subsequent requests.
+            log(f"Cannot check re-export {module}.{symbol}: {error}")
+            return False
+        return self.reexports[key]
+
     def refresh(self):
         if time.monotonic() - self.updated < 2:
             return
         modules, references, seen = {}, {}, set()
+        compiled_modules = set()
+        previous = {path: value[0] for path, value in self.parsed.items()}
         for root in self.roots:
             for path, module, is_package in module_files(root):
                 if path in seen:
@@ -435,7 +475,9 @@ class ImportIndex:
                     self.parsed[path] = (stamp, exports)
                     if isinstance(exports, dict):
                         for name, symbols in exports.items():
-                            modules.setdefault(name, set(symbols))
+                            if name not in modules:
+                                modules[name] = set(symbols)
+                                compiled_modules.add(name)
                     elif module not in modules:
                         modules[module], references[module] = set(exports[0]), exports[1]
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -471,7 +513,10 @@ class ImportIndex:
                 if re.fullmatch(IDENTIFIER, name) and not name.startswith("_"):
                     symbols.setdefault(name, set()).add(module)
         self.symbols = symbols
+        self.compiled_modules = compiled_modules
         self.parsed = {path: value for path, value in self.parsed.items() if path in seen}
+        if previous != {path: value[0] for path, value in self.parsed.items()}:
+            self.reexports.clear()
         self.updated = time.monotonic()
 
     def candidates(self, name, uri=None):
@@ -489,10 +534,21 @@ class ImportIndex:
                     excluded.add(".".join(parts))
                 except ValueError:
                     pass
-        return sorted(
-            set(self.symbols.get(name, ())) - excluded,
-            key=lambda module: (module.count("."), module),
-        )
+        candidates = set(self.symbols.get(name, ())) - excluded
+        parents = set()
+        for module in candidates & self.compiled_modules:
+            parts = module.split(".")
+            parents.update(".".join(parts[:length]) for length in range(1, len(parts)))
+        # Bound first-use latency. Successful/failed checks are reused until an
+        # indexed file changes; timed-out or unvisited checks can be retried.
+        deadline = time.monotonic() + 2
+        for parent in sorted(parents - candidates - excluded, key=import_rank):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self.verified_reexport(parent, name, remaining):
+                candidates.add(parent)
+        return sorted(candidates, key=import_rank)
 
 
 def import_actions(params, text, index):
@@ -519,7 +575,7 @@ def import_actions(params, text, index):
         candidates = ([hint[1]] if hint and hint[2] == symbol else []) + index.candidates(
             symbol, params["textDocument"]["uri"]
         )
-        for module in candidates[:12]:
+        for module in sorted(set(candidates), key=import_rank)[:12]:
             if (module, symbol) in seen:
                 continue
             seen.add((module, symbol))
@@ -583,6 +639,10 @@ def prepare(server, args, workspace, cache, initialize):
         unique_paths(([stdlib] if stdlib else []) + paths, workspace),
         Path(server).with_name("mojo" + (".exe" if os.name == "nt" else "")),
         cache / "import-index",
+        # Metadata/import checks need no source locations. Keep the compiler's
+        # original stdlib configuration: reparsing stdlib sources in each short-
+        # lived doc process is much slower than the server's incremental parse.
+        os.environ.copy(),
     )
     return command, index, environment
 
