@@ -14,13 +14,23 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1,wasm32-wasip2
 
       - name: Check native target
         run: cargo check
 
       - name: Check Zed extension target
         run: cargo check --target wasm32-wasip1
+
+      - name: Build current Zed extension target
+        run: cargo build --release --target wasm32-wasip2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Test language server bridge
+        run: python3 -m unittest discover -s tests -v
 
       - name: Check snippets
         run: bash scripts/check-snippets.sh

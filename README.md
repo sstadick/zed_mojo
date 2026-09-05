@@ -11,12 +11,16 @@ This fork is maintained at [`sstadick/zed_mojo`](https://github.com/sstadick/zed
 - Syntax highlighting queries in `languages/mojo/highlights.scm`
 - Editor queries for bracket matching, indentation, outline, and Vim text objects
 - LSP integration for `mojo-lsp-server`
+- Go-to-definition into matching Mojo standard-library sources
+- Quick fixes to import missing symbols from the standard library, project, and installed packages
 - Mojo snippets in `snippets/mojo.json`
 - Runnable detection for `def main` / `fn main` in `languages/mojo/runnables.scm`
 - Default runnable task binding in `languages/mojo/tasks.json`
 - Tree-sitter grammar pinned to [`vadim-su/tree-sitter-mojo`](https://github.com/vadim-su/tree-sitter-mojo)
 
 ## Install locally in Zed
+
+Have Mojo, Python 3.10 or newer (`python3`), and Git available in the environment Zed uses. Python runs the bundled language-server bridge; it has no third-party dependencies. Git is used for the first stdlib source download.
 
 1. Open Zed.
 2. Run `zed: extensions` from the command palette.
@@ -34,7 +38,7 @@ This extension registers `mojo-lsp-server` as the default language server for Mo
 
 The server is launched through the `PATH` inherited by Zed; the extension does not pin a machine-specific executable path.
 
-The server is started with no arguments. If you want `mojo-lsp-server` to additionally parse and type-check code blocks inside docstrings, pass `--check-docstrings` under `binary.arguments` in the settings example below. By default this check is off, so the server validates file structure but ignores errors inside docstring examples.
+No default diagnostic flags are passed to the server. The bridge adds source and package search paths with `-I`, and preserves your `binary.arguments` and `binary.env`. If you want `mojo-lsp-server` to additionally parse and type-check code blocks inside docstrings, pass `--check-docstrings` under `binary.arguments`. That check is off by default.
 
 Before opening a `.mojo` file, make sure the executable is visible from the environment that launches Zed:
 
@@ -65,6 +69,40 @@ You can override the language server command, arguments, and environment in Zed 
 ```
 
 If autocomplete does not appear, first verify that Zed can start the server, then check `zed: open log` for LSP startup errors. Repeated `mojo-lsp-server failed: server shut down` messages mean the server process exited and Zed is still draining stale requests; reload the window to restart it.
+
+### Standard-library navigation
+
+On first use, the extension detects the server's Mojo version and caches the matching `mojo/v<version>` tag from [`modular/modular`](https://github.com/modular/modular), using a sparse checkout of the standard library. It adds those sources to the language server's search paths so native go-to-definition works for stdlib functions, types, built-ins, and methods. Project definitions still come from the same Mojo language server. First startup includes the source download; later starts reuse the cache.
+
+An existing stdlib source directory on your import path is used before downloading. For an offline setup, a nightly/custom compiler, or a local stdlib checkout, set `stdlib_path` to the directory containing `std/`. Use sources matching your compiler: the extension deliberately does not substitute `main` for an unknown release. If downloading fails, the original server still starts and logs how to configure local sources.
+
+### Import quick fixes
+
+When Mojo reports an unknown declaration, open Zed's code-actions menu on the underlined symbol and choose **Import `<symbol>` from `<module>`**. For example, `sqrt(1.0)` offers `from std.math import sqrt`. The edit inserts an import while preserving the file's header, module docstring, existing imports, and line endings. Existing Mojo quick fixes remain available.
+
+The import index searches the worktree, stdlib sources, `-I` directories, Mojo's configured import paths, `MOJO_IMPORT_PATH`, and the selected compiler's `lib/mojo` directory. Source packages include public declarations and re-exports; compiled packages are indexed with the matching `mojo doc` command and cached. Packages must already be installed or available on an import path. A compiled package may offer its defining submodule instead of a top-level re-export. Dynamically generated or conditional exports may not be discovered.
+
+### Source and bridge settings
+
+These optional settings live under the existing language server's `initialization_options`:
+
+```json
+{
+  "lsp": {
+    "mojo-lsp-server": {
+      "initialization_options": {
+        "zed_mojo": {
+          "stdlib_path": "/path/to/modular/mojo/stdlib",
+          "download_stdlib": false,
+          "import_paths": ["/path/to/packages"]
+        }
+      }
+    }
+  }
+}
+```
+
+Omit `stdlib_path` to detect/download sources automatically; `download_stdlib` defaults to `true`. Relative paths resolve against the worktree. `import_paths` are added to both the server and import index. Restart the language server after changing these settings. To run the original server directly, set `initialization_options.zed_mojo.enabled` to `false`; this disables the added features and removes the Python requirement.
 
 ## Snippets
 
@@ -111,6 +149,8 @@ Zed compiles Rust extensions to WebAssembly. To check that target locally, insta
 ```sh
 rustup target add wasm32-wasip1
 cargo check --target wasm32-wasip1
+rustup target add wasm32-wasip2
+cargo build --release --target wasm32-wasip2
 ```
 
 Run the extension query and snippet checks:
@@ -120,6 +160,17 @@ bash scripts/check-snippets.sh
 bash scripts/check-indents.sh
 bash scripts/check-highlight-order.sh
 bash scripts/check-runnables.sh
+python3 -m unittest discover -s tests -v
 ```
+
+The bridge tests include a protocol peer to exercise message forwarding, native quick fixes, and unsaved edits without installing Mojo. To also run the real-server integration test, use an activated Mojo environment and set:
+
+```sh
+MOJO_LSP_SERVER="$(command -v mojo-lsp-server)" \
+MOJO_STDLIB_PATH=/path/to/modular/mojo/stdlib \
+python3 -m unittest discover -s tests -v
+```
+
+That test checks stdlib and local definitions, applies stdlib and compiled-package import fixes, and builds the resulting Mojo program. The bridge is embedded from `server/mojo_lsp.py` into the Rust extension; rebuild the extension after changing either file.
 
 `extension.wasm` is a generated build artifact and is intentionally ignored by git.
