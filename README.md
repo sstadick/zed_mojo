@@ -30,7 +30,7 @@ This extension registers `mojo-lsp-server` as the default language server for Mo
 
 The server is launched through the `PATH` inherited by Zed; the extension does not pin a machine-specific executable path.
 
-By default, the extension starts the server with `--skip-docstring-checks`. This avoids extra parsing and type-checking work inside docstring examples, which can otherwise leave the server busy or stale after edits in some Mojo LSP builds.
+The server is started with no arguments. If you want `mojo-lsp-server` to additionally parse and type-check code blocks inside docstrings, pass `--check-docstrings` under `binary.arguments` in the settings example below. By default this check is off, so the server validates file structure but ignores errors inside docstring examples.
 
 Before opening a `.mojo` file, make sure the executable is visible from the environment that launches Zed:
 

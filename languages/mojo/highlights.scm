@@ -150,6 +150,8 @@
   "while"
   "with"
   "yield"
+  "match"
+  "case"
 ] @keyword
 
 ; Mojo-specific declaration keywords. The grammar accepts each as an

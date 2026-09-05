@@ -2,7 +2,6 @@ use zed_extension_api::{self as zed, Result};
 
 const LANGUAGE_SERVER_ID: &str = "mojo-lsp-server";
 const SERVER_NAME: &str = "mojo-lsp-server";
-const DEFAULT_ARGS: &[&str] = &["--skip-docstring-checks"];
 
 struct MojoExtension;
 
@@ -20,10 +19,7 @@ impl zed::Extension for MojoExtension {
             zed::settings::LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
 
         let binary = lsp_settings.binary;
-        let mut args = DEFAULT_ARGS
-            .iter()
-            .map(|arg| arg.to_string())
-            .collect::<Vec<_>>();
+        let mut args = Vec::new();
         let mut env = worktree.shell_env();
         let binary_path = binary
             .as_ref()
