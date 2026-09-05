@@ -2,6 +2,8 @@
 
 Zed extension that adds Mojo language support for files with the `.mojo` suffix.
 
+This fork is maintained at [`sstadick/zed_mojo`](https://github.com/sstadick/zed_mojo), based on [`vadim-su/zed_mojo`](https://github.com/vadim-su/zed_mojo).
+
 ## What is included
 
 - Zed extension metadata in `extension.toml`
@@ -21,6 +23,8 @@ Zed extension that adds Mojo language support for files with the `.mojo` suffix.
 3. Click `Install Dev Extension`.
 4. Select this repository directory: `zed_mojo`.
 5. Open a `.mojo` file.
+
+Installing this checkout as a dev extension replaces the published Mojo extension. Zed shows the published version as "Overridden by dev extension" and uses this local checkout for future development. After changing the extension, use its `Rebuild` button on the extensions page.
 
 If the extension does not appear immediately, reload Zed with `zed: reload window`.
 
