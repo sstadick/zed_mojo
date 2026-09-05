@@ -153,6 +153,64 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(index.compiled_exports(Path("std.mojoc"), "std"), {})
             run.assert_not_called()
 
+    def test_compiled_reexports_are_verified_ranked_and_cached(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "pkg.mojoc"
+            package.touch()
+            environment = {**os.environ, "MODULAR_MOJO_MAX_IMPORT_PATH": str(root)}
+            index = bridge.ImportIndex([root], Path(sys.executable), root / ".cache", environment)
+            exports = {"pkg": [], "pkg.raw": [], "pkg.raw.types": ["KEY_Z", "Hidden"]}
+
+            def check_import(args, **kwargs):
+                text = Path(args[2]).read_text()
+                self.assertIn(str(root), args)
+                self.assertLessEqual(kwargs["timeout"], 2)
+                self.assertEqual(kwargs["env"], environment)
+                return subprocess.CompletedProcess(
+                    args, 0 if text == "from pkg import KEY_Z\n" else 1
+                )
+
+            with patch.object(index, "compiled_exports", return_value=exports), patch.object(
+                subprocess, "run", side_effect=check_import
+            ) as run:
+                self.assertEqual(index.candidates("KEY_Z"), ["pkg", "pkg.raw.types"])
+                self.assertEqual(run.call_count, 2)
+                index.updated = 0
+                self.assertEqual(index.candidates("KEY_Z"), ["pkg", "pkg.raw.types"])
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(index.candidates("Hidden"), ["pkg.raw.types"])
+                # A new build can change re-exports without changing documented names.
+                package.write_bytes(b"new build")
+                index.updated = 0
+                run.side_effect = lambda *args, **kwargs: subprocess.CompletedProcess([], 1)
+                self.assertEqual(index.candidates("KEY_Z"), ["pkg.raw.types"])
+                self.assertEqual(run.call_count, 6)
+
+    def test_compiled_reexport_probe_failure_keeps_defining_import(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "pkg.mojoc").touch()
+            index = bridge.ImportIndex([root], Path(sys.executable), root / ".cache")
+            with patch.object(
+                index, "compiled_exports", return_value={"pkg.impl": ["Thing"]}
+            ), patch.object(
+                subprocess, "run", side_effect=subprocess.TimeoutExpired("mojo", 2)
+            ) as run:
+                self.assertEqual(index.candidates("Thing"), ["pkg.impl"])
+                run.side_effect = lambda *args, **kwargs: subprocess.CompletedProcess([], 0)
+                self.assertEqual(index.candidates("Thing"), ["pkg", "pkg.impl"])
+
+    def test_compiled_reexport_probes_have_a_total_time_budget(self):
+        index = bridge.ImportIndex([], Path(sys.executable), Path("unused"))
+        index.symbols = {"KEY_Z": {"pkg.raw.types"}}
+        index.compiled_modules = {"pkg.raw.types"}
+        with patch.object(index, "refresh"), patch.object(
+            bridge.time, "monotonic", side_effect=[0, 0, 3]
+        ), patch.object(index, "verified_reexport", return_value=True) as verify:
+            self.assertEqual(index.candidates("KEY_Z"), ["pkg", "pkg.raw.types"])
+            verify.assert_called_once_with("pkg", "KEY_Z", 2)
+
 
 class ActionTests(unittest.TestCase):
     def setUp(self):
@@ -179,6 +237,16 @@ class ActionTests(unittest.TestCase):
         )
         edit = actions[0]["edit"]["changes"]["file:///test.mojo"][0]
         self.assertTrue(apply_edit(self.text, edit).startswith("from std.math import sqrt\n"))
+
+    def test_defining_module_hint_does_not_outrank_public_reexport(self):
+        self.diagnostic["message"] = (
+            "use of unknown declaration 'sqrt'; Add 'from std.math.math import sqrt'"
+        )
+        actions = bridge.import_actions(self.params, self.text, self.index)
+        self.assertEqual(
+            [action["title"] for action in actions],
+            ["Import sqrt from std.math", "Import sqrt from std.math.math"],
+        )
 
     def test_filter_kinds_ranges_stale_diagnostics_and_qualified_names(self):
         self.params["context"]["only"] = ["refactor"]
@@ -244,6 +312,8 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(
                 environment["MODULAR_MOJO_MAX_IMPORT_PATH"].split(",")[0], str(root / "sources")
             )
+            # Short-lived doc probes must retain the fast compiled-stdlib setup.
+            self.assertEqual(index.environment, dict(os.environ))
 
     def test_modular_config_and_environment_search_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -445,9 +515,12 @@ class IntegrationTests(unittest.TestCase):
             packages.mkdir()
             source = root / ".package-source/geometry"
             source.mkdir(parents=True)
-            (source / "__init__.mojo").write_text(
+            (source / "__init__.mojo").write_text("from .impl import Widget\nfrom .keys import *\n")
+            (source / "impl.mojo").write_text(
                 "struct Widget(Copyable, Movable):\n    var value: Int\n    def __init__(out self, value: Int):\n        self.value = value\n"
             )
+            (source / "keys.mojo").write_text("comptime KEY_Z = 90\n")
+            (source / "internal.mojo").write_text("comptime NOT_REEXPORTED = 12\n")
             compiled = packages / "geometry.mojoc"
             subprocess.run(
                 [
@@ -462,6 +535,15 @@ class IntegrationTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
+            index = bridge.ImportIndex(
+                [packages, server.parent.parent / "lib/mojo"], compiler, root / ".index"
+            )
+            self.assertEqual(index.candidates("Widget"), ["geometry", "geometry.impl"])
+            self.assertEqual(
+                [name for name in index.candidates("KEY_Z") if name.split(".")[0] == "geometry"],
+                ["geometry", "geometry.keys"],
+            )
+            self.assertEqual(index.candidates("NOT_REEXPORTED"), ["geometry.internal"])
             (root / "local_helpers.mojo").write_text("def helper() -> Int:\n    return 1\n")
             command = [
                 sys.executable,
@@ -501,13 +583,14 @@ class IntegrationTests(unittest.TestCase):
                         any(location["uri"].endswith(expected) for location in locations),
                         (line, column, locations),
                     )
-                broken = "def main():\n    print(sqrt(1.0))\n    var widget = Widget(7)\n    print(widget.value)\n"
+                broken = "def main():\n    print(sqrt(1.0))\n    var widget = Widget(7)\n    print(widget.value)\n    print(KEY_Z)\n"
                 broken_uri = client.open(root / "missing.mojo", broken)
                 diagnostics = client.diagnostics[broken_uri]["diagnostics"]
                 fixed = broken
                 for symbol, line, column, expected in (
                     ("sqrt", 1, 11, "std.math"),
                     ("Widget", 2, 17, "geometry"),
+                    ("KEY_Z", 4, 11, "geometry"),
                 ):
                     actions = client.request(
                         "textDocument/codeAction",
@@ -517,11 +600,8 @@ class IntegrationTests(unittest.TestCase):
                             "context": {"diagnostics": diagnostics, "only": ["quickfix"]},
                         },
                     )
-                    action = next(
-                        action
-                        for action in actions
-                        if action["title"] == f"Import {symbol} from {expected}"
-                    )
+                    action = actions[0]
+                    self.assertEqual(action["title"], f"Import {symbol} from {expected}")
                     fixed = apply_edit(fixed, action["edit"]["changes"][broken_uri][0])
                 fixed_path = root / "fixed.mojo"
                 fixed_path.write_text(fixed)
