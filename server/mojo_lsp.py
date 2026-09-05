@@ -373,13 +373,78 @@ def import_rank(module):
     return module.count("."), module
 
 
+def resolve_reexports(modules, references):
+    for _ in range(len(references) + 1):
+        changed = False
+        for module, imports in references.items():
+            for target, original, exported in imports:
+                available = modules.get(target, set())
+                additions = (
+                    {name for name in available if not name.startswith("_")}
+                    if original == "*"
+                    else (
+                        {exported}
+                        if original in available or f"{target}.{original}" in modules
+                        else set()
+                    )
+                )
+                if additions - modules[module]:
+                    modules[module].update(additions)
+                    changed = True
+        if not changed:
+            break
+
+
+def valid_exports(exports):
+    return isinstance(exports, dict) and all(
+        isinstance(name, str)
+        and isinstance(symbols, list)
+        and all(isinstance(symbol, str) for symbol in symbols)
+        for name, symbols in exports.items()
+    )
+
+
 class ImportIndex:
-    def __init__(self, roots, compiler, cache, environment=None):
+    def __init__(self, roots, compiler, cache, environment=None, immutable_roots=None):
         self.roots, self.compiler, self.cache = roots, compiler, cache
         self.environment = environment
         self.parsed, self.symbols = {}, {}
         self.compiled_modules, self.reexports = set(), {}
+        self.completed_packages = {}
+        self.package_context = ()
+        self.immutable_roots = immutable_roots or {}
+        self.immutable_modules = {}
+        self.file_signature = None
         self.updated = 0
+
+    def immutable_exports(self, root):
+        if root in self.immutable_modules:
+            return self.immutable_modules[root]
+        key = hashlib.sha256(
+            repr(("source-imports-v1", str(root), self.immutable_roots[root])).encode()
+        ).hexdigest()
+        cached = self.cache / f"stdlib-{key}.json"
+        try:
+            exports = json.loads(cached.read_text())
+            if not valid_exports(exports):
+                raise ValueError("invalid stdlib index")
+        except (OSError, ValueError):
+            modules, references = {}, {}
+            for path, module, package in module_files(root):
+                if path.suffix == ".mojo":
+                    names, imports = source_exports(
+                        path.read_text(encoding="utf-8"), module, package
+                    )
+                    modules[module], references[module] = names, imports
+            resolve_reexports(modules, references)
+            exports = {module: sorted(names) for module, names in modules.items()}
+            self.cache.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="source-index-", dir=self.cache) as temporary:
+                staging = Path(temporary) / "index.json"
+                staging.write_text(json.dumps(exports))
+                os.replace(staging, cached)
+        self.immutable_modules[root] = exports
+        return exports
 
     def compiled_exports(self, path, module):
         # Mojo 1.0's doc tool crashes on std.mojoc. Index the matching source tree.
@@ -389,19 +454,44 @@ class ImportIndex:
         key = hashlib.sha256(
             repr(
                 (
+                    "compiled-imports-v2",
                     str(path),
                     stat.st_mtime_ns,
                     stat.st_size,
                     str(self.compiler),
                     compiler_stat.st_mtime_ns,
                     [str(p) for p in self.roots],
+                    self.package_context,
+                    {
+                        name: (self.environment or os.environ).get(name)
+                        for name in (
+                            "MODULAR_HOME",
+                            "MODULAR_MOJO_MAX_IMPORT_PATH",
+                            "MOJO_IMPORT_PATH",
+                        )
+                    },
                 )
             ).encode()
         ).hexdigest()
         self.cache.mkdir(parents=True, exist_ok=True)
         cached = self.cache / f"{key}.json"
+        self.completed_packages[path] = set()
         if cached.is_file():
-            return json.loads(cached.read_text())
+            try:
+                document = json.loads(cached.read_text())
+                exports = document["exports"]
+                if (
+                    not valid_exports(exports)
+                    or not isinstance(document["complete"], list)
+                    or not all(
+                        isinstance(name, str) and name in exports for name in document["complete"]
+                    )
+                ):
+                    raise ValueError("invalid package index")
+                self.completed_packages[path] = set(document["complete"])
+                return exports
+            except (OSError, ValueError, KeyError, TypeError):
+                log(f"Rebuilding invalid cached import index for {module}")
         with tempfile.TemporaryDirectory(prefix="package-docs-", dir=self.cache) as temporary:
             output = Path(temporary) / "docs.json"
             args = [str(self.compiler), "doc", str(path), "-o", str(output)]
@@ -412,10 +502,99 @@ class ImportIndex:
             exports = {}
             for name, symbols in doc_exports(document["decl"], module):
                 exports[name] = sorted(set(exports.get(name, ())) | symbols)
+            # Materialize each public package surface once, not once per symbol.
+            # A trailing failing import proves that the compiler reached every
+            # probe even when some names are intentionally not re-exported.
+            deadline = time.monotonic() + 10
+            for parent in sorted(exports, key=import_rank):
+                if time.monotonic() >= deadline:
+                    break
+                descendants = {
+                    symbol
+                    for child, symbols in exports.items()
+                    if child.startswith(parent + ".")
+                    for symbol in symbols
+                    if re.fullmatch(IDENTIFIER, symbol) and not symbol.startswith("_")
+                } - set(exports[parent])
+                if not descendants:
+                    continue
+                verified = self.probe_imports(
+                    parent,
+                    sorted(descendants),
+                    Path(temporary),
+                    max(0.01, deadline - time.monotonic()),
+                )
+                if verified is not None:
+                    exports[parent] = sorted(set(exports[parent]) | verified)
+                    self.completed_packages[path].add(parent)
             staging = Path(temporary) / "index.json"
-            staging.write_text(json.dumps(exports))
+            staging.write_text(
+                json.dumps({"exports": exports, "complete": sorted(self.completed_packages[path])})
+            )
             os.replace(staging, cached)
             return exports
+
+    def probe_imports(self, module, symbols, temporary, timeout=10):
+        sentinel = "_zed_mojo_probe_end_7c42b0a1"
+        names = symbols + [sentinel]
+        source = temporary / "imports.mojo"
+        source.write_text(
+            "".join(
+                f"from {module} import {name} as _zed_import_{index}\n"
+                for index, name in enumerate(names)
+            ),
+            encoding="utf-8",
+        )
+        args = [
+            str(self.compiler),
+            "doc",
+            str(source),
+            "--diagnostic-format",
+            "json",
+            "-o",
+            str(temporary / "imports.json"),
+        ]
+        for root in self.roots:
+            args.extend(["-I", str(root)])
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout, env=self.environment
+            )
+            if result.returncode != 1:
+                return None
+            rejected = set()
+            for line in result.stderr.splitlines():
+                if not line.startswith("{"):
+                    continue
+                diagnostic = json.loads(line)
+                if not isinstance(diagnostic, dict):
+                    return None
+                if diagnostic.get("kind") != "error":
+                    continue
+                detail = diagnostic.get("diagnostic", {})
+                if not isinstance(detail, dict) or not isinstance(detail.get("location", {}), dict):
+                    return None
+                if not detail and diagnostic.get("message") == "could not generate documentation":
+                    continue
+                number = detail.get("location", {}).get("line", 0)
+                if Path(
+                    detail.get("file", "")
+                ).resolve() != source.resolve() or not 1 <= number <= len(names):
+                    return None
+                symbol = names[number - 1]
+                message = diagnostic.get("message", "")
+                if not isinstance(message, str) or not (
+                    message.endswith(f"does not contain '{symbol}'")
+                    or message.endswith(f"has no declaration '{symbol}'")
+                ):
+                    return None
+                rejected.add(symbol)
+            if sentinel not in rejected:
+                return None
+            return set(symbols) - rejected
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+            log(f"Cannot index public imports for {module}: {error}")
+            return None
 
     def verified_reexport(self, module, symbol, timeout):
         """Docs omit compiled imports. Ask the compiler instead of assuming a re-export."""
@@ -455,56 +634,54 @@ class ImportIndex:
         modules, references, seen = {}, {}, set()
         compiled_modules = set()
         previous = {path: value[0] for path, value in self.parsed.items()}
+        files, package_stamps = [], []
         for root in self.roots:
-            for path, module, is_package in module_files(root):
-                if path in seen:
-                    continue
-                seen.add(path)
-                try:
-                    stat = path.stat()
-                    stamp = (stat.st_mtime_ns, stat.st_size)
-                    cached = self.parsed.get(path)
-                    if cached and cached[0] == stamp:
-                        exports = cached[1]
-                    elif path.suffix == ".mojo":
-                        exports = source_exports(
-                            path.read_text(encoding="utf-8"), module, is_package
-                        )
-                    else:
-                        exports = self.compiled_exports(path, module)
-                    self.parsed[path] = (stamp, exports)
-                    if isinstance(exports, dict):
-                        for name, symbols in exports.items():
-                            if name not in modules:
-                                modules[name] = set(symbols)
-                                compiled_modules.add(name)
-                    elif module not in modules:
-                        modules[module], references[module] = set(exports[0]), exports[1]
-                except (OSError, ValueError, subprocess.SubprocessError) as error:
-                    log(f"Cannot index {path.name}: {error}")
-                    if path.is_file():
-                        stat = path.stat()
-                        self.parsed[path] = ((stat.st_mtime_ns, stat.st_size), {})
-        # Resolve relative imports, aliases and wildcard re-exports, including cycles.
-        for _ in range(len(references) + 1):
-            changed = False
-            for module, imports in references.items():
-                for target, original, exported in imports:
-                    available = modules.get(target, set())
-                    additions = (
-                        {name for name in available if not name.startswith("_")}
-                        if original == "*"
-                        else (
-                            {exported}
-                            if original in available or f"{target}.{original}" in modules
-                            else set()
-                        )
-                    )
-                    if additions - modules[module]:
-                        modules[module].update(additions)
-                        changed = True
-            if not changed:
-                break
+            if root not in self.immutable_roots:
+                files.extend(module_files(root))
+        stamps = {}
+        for path, _, _ in files:
+            try:
+                stat = path.stat()
+                stamps[path] = (stat.st_mtime_ns, stat.st_size)
+                if path.suffix != ".mojo":
+                    package_stamps.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                pass
+        signature = tuple(stamps.items())
+        if signature == self.file_signature:
+            self.updated = time.monotonic()
+            return
+        for root in self.immutable_roots:
+            for module, names in self.immutable_exports(root).items():
+                modules.setdefault(module, set(names))
+        self.package_context = tuple(package_stamps)
+        for path, module, is_package in files:
+            if path in seen or path not in stamps:
+                continue
+            seen.add(path)
+            try:
+                stamp = stamps[path]
+                if path.suffix != ".mojo":
+                    stamp += (self.package_context,)
+                cached = self.parsed.get(path)
+                if cached and cached[0] == stamp:
+                    exports = cached[1]
+                elif path.suffix == ".mojo":
+                    exports = source_exports(path.read_text(encoding="utf-8"), module, is_package)
+                else:
+                    exports = self.compiled_exports(path, module)
+                self.parsed[path] = (stamp, exports)
+                if isinstance(exports, dict):
+                    for name, symbols in exports.items():
+                        if name not in modules:
+                            modules[name] = set(symbols)
+                            compiled_modules.add(name)
+                elif module not in modules:
+                    modules[module], references[module] = set(exports[0]), exports[1]
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                log(f"Cannot index {path.name}: {error}")
+                self.parsed[path] = (stamp, {})
+        resolve_reexports(modules, references)
         symbols = {}
         for module, names in modules.items():
             if any(part.startswith("_") for part in module.split(".")):
@@ -514,10 +691,14 @@ class ImportIndex:
                     symbols.setdefault(name, set()).add(module)
         self.symbols = symbols
         self.compiled_modules = compiled_modules
+        self.completed_packages = {
+            path: value for path, value in self.completed_packages.items() if path in seen
+        }
         self.parsed = {path: value for path, value in self.parsed.items() if path in seen}
         if previous != {path: value[0] for path, value in self.parsed.items()}:
             self.reexports.clear()
         self.updated = time.monotonic()
+        self.file_signature = signature
 
     def candidates(self, name, uri=None):
         self.refresh()
@@ -542,7 +723,8 @@ class ImportIndex:
         # Bound first-use latency. Successful/failed checks are reused until an
         # indexed file changes; timed-out or unvisited checks can be retried.
         deadline = time.monotonic() + 2
-        for parent in sorted(parents - candidates - excluded, key=import_rank):
+        complete = set().union(*self.completed_packages.values()) & self.compiled_modules
+        for parent in sorted(parents - candidates - excluded - complete, key=import_rank):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -635,6 +817,14 @@ def prepare(server, args, workspace, cache, initialize):
         environment["MODULAR_MOJO_MAX_IMPORT_PATH"] = ",".join(
             str(path) for path in unique_paths([stdlib] + config_paths, workspace)
         )
+    immutable_roots = {}
+    if stdlib and not config.get("stdlib_path"):
+        for parent in stdlib.parents:
+            if parent.parent == cache.resolve() and parent.name.startswith("stdlib-"):
+                head = parent / ".git/HEAD"
+                if head.is_file():
+                    immutable_roots[stdlib] = head.read_text().strip()
+                break
     index = ImportIndex(
         unique_paths(([stdlib] if stdlib else []) + paths, workspace),
         Path(server).with_name("mojo" + (".exe" if os.name == "nt" else "")),
@@ -643,6 +833,7 @@ def prepare(server, args, workspace, cache, initialize):
         # original stdlib configuration: reparsing stdlib sources in each short-
         # lived doc process is much slower than the server's incremental parse.
         os.environ.copy(),
+        immutable_roots,
     )
     return command, index, environment
 
