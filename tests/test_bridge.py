@@ -453,6 +453,28 @@ class SetupTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_pipe_reader_keeps_initialize_read_ahead(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            data = io.BytesIO()
+            messages = [
+                {"id": 1, "method": "initialize"},
+                {"method": "initialized"},
+                {"id": 2, "result": "😀"},
+            ]
+            for message in messages:
+                bridge.write_message(data, message)
+            os.write(write_fd, data.getvalue())
+            os.close(write_fd)
+            write_fd = None
+            reader = bridge.PipeReader(read_fd)
+            self.assertEqual([bridge.read_message(reader) for _ in messages], messages)
+            self.assertIsNone(bridge.read_message(reader))
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
+
     def test_utf8_framing_and_multiple_messages(self):
         stream = io.BytesIO()
         messages = [{"jsonrpc": "2.0", "id": "a", "result": "😀"}, {"method": "exit"}]
@@ -490,6 +512,7 @@ class LspClient:
                 "processId": None,
                 "rootUri": root.as_uri(),
                 "capabilities": {
+                    "window": {"workDoneProgress": True},
                     "textDocument": {
                         "definition": {"linkSupport": True},
                         "codeAction": {
@@ -497,7 +520,7 @@ class LspClient:
                                 "codeActionKind": {"valueSet": ["quickfix"]}
                             }
                         },
-                    }
+                    },
                 },
                 "initializationOptions": options,
             },
@@ -511,6 +534,10 @@ class LspClient:
             raise AssertionError(self.stderr.read().decode())
         if message.get("method") == "textDocument/publishDiagnostics":
             self.diagnostics[message["params"]["uri"]] = message["params"]
+        if "method" in message and "id" in message:
+            bridge.write_message(
+                self.process.stdin, {"jsonrpc": "2.0", "id": message["id"], "result": None}
+            )
         return message
 
     def request(self, method, params):
@@ -526,10 +553,6 @@ class LspClient:
                 if "error" in message:
                     raise AssertionError(message["error"])
                 return message.get("result")
-            if "method" in message and "id" in message:
-                bridge.write_message(
-                    self.process.stdin, {"jsonrpc": "2.0", "id": message["id"], "result": None}
-                )
 
     def notify(self, method, params):
         bridge.write_message(
@@ -551,6 +574,9 @@ class LspClient:
             self.request("shutdown", None)
             self.notify("exit", {})
             self.process.wait(timeout=10)
+            self.stderr.seek(0)
+            errors = self.stderr.read().decode()
+            self.assert_clean_exit(errors)
         finally:
             if self.process.poll() is None:
                 self.process.kill()
@@ -559,8 +585,238 @@ class LspClient:
             self.process.stdout.close()
             self.stderr.close()
 
+    def assert_clean_exit(self, errors):
+        if self.process.returncode != 0 or "Fatal Python error" in errors:
+            raise AssertionError(errors or f"Bridge exit status {self.process.returncode}")
+
 
 class ProxyTests(unittest.TestCase):
+    def test_cancelled_worker_cannot_reply_to_reused_request_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            gate = root / "release-worker"
+            wrapper = (
+                f"import sys; sys.path.insert(0, {str(Path(bridge.__file__).parent)!r})\n"
+                "import mojo_lsp, time\n"
+                "from pathlib import Path\n"
+                "def slow_actions(*args):\n"
+                "    deadline = time.monotonic() + 10\n"
+                f"    while not Path({str(gate)!r}).exists() and time.monotonic() < deadline:\n"
+                "        time.sleep(0.01)\n"
+                "    return []\n"
+                "mojo_lsp.import_actions = slow_actions\n"
+                "sys.exit(mojo_lsp.main() or 0)\n"
+            )
+            command = [
+                sys.executable,
+                "-c",
+                wrapper,
+                "--server",
+                sys.executable,
+                "--workspace",
+                str(root),
+                "--cache",
+                str(root / ".cache"),
+                "--",
+                str(Path(__file__).with_name("fake_server.py")),
+            ]
+            client = LspClient(command, root, {"zed_mojo": {"download_stdlib": False}})
+            try:
+                uri = client.open(root / "main.mojo", "# unsaved\n")
+                ident = "reused-action-id"
+                params = {
+                    "textDocument": {"uri": uri},
+                    "range": span(0, 0, 0),
+                    "context": {"diagnostics": []},
+                }
+                for marker in ("cancelled", "current"):
+                    bridge.write_message(
+                        client.process.stdin,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": ident,
+                            "method": "textDocument/codeAction",
+                            "params": {**params, "testMarker": marker},
+                        },
+                    )
+                    if marker == "cancelled":
+                        # The fake server replies in order: echo is a barrier for
+                        # the native code-action result being queued for augmentation.
+                        client.request("test/echo", {})
+                        client.notify("$/cancelRequest", {"id": ident})
+                    else:
+                        client.request("test/echo", {})
+                        gate.touch()
+                    while True:
+                        response = client.receive()
+                        if response.get("id") == ident:
+                            break
+                    if marker == "cancelled":
+                        self.assertEqual(response["error"]["code"], -32800)
+                    else:
+                        self.assertEqual(response["result"][0]["data"]["marker"], "current")
+            finally:
+                gate.touch()
+                client.close()
+
+    def test_recovery_handshake_timeout_exits_cleanly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            wrapper = (
+                f"import sys; sys.path.insert(0, {str(Path(bridge.__file__).parent)!r}); "
+                "import mojo_lsp; mojo_lsp.RECOVERY_TIMEOUT = 0.2; "
+                "sys.exit(mojo_lsp.main() or 0)"
+            )
+            command = [
+                sys.executable,
+                "-c",
+                wrapper,
+                "--server",
+                sys.executable,
+                "--workspace",
+                str(root),
+                "--cache",
+                str(root / ".cache"),
+                "--",
+                str(Path(__file__).with_name("fake_server.py")),
+            ]
+            client = LspClient(
+                command,
+                root,
+                {
+                    "zed_mojo": {"download_stdlib": False},
+                    "test_restart_marker": str(root / "crashed"),
+                },
+            )
+            try:
+                client.notify("test/crash", {})
+                self.assertEqual(client.process.wait(timeout=10), 1)
+                client.stderr.seek(0)
+                errors = client.stderr.read().decode()
+                self.assertIn("timed out while reinitializing", errors)
+                self.assertNotIn("Fatal Python error", errors)
+            finally:
+                if client.process.poll() is None:
+                    client.process.kill()
+                    client.process.wait()
+                client.process.stdin.close()
+                client.process.stdout.close()
+                client.stderr.close()
+
+    def test_backend_failure_does_not_abort_bridge_with_stdin_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            command = [
+                sys.executable,
+                str(Path(bridge.__file__)),
+                "--server",
+                sys.executable,
+                "--workspace",
+                str(root),
+                "--cache",
+                str(root / ".cache"),
+                "--",
+                str(Path(__file__).with_name("fake_server.py")),
+            ]
+            client = LspClient(
+                command, root, {"zed_mojo": {"download_stdlib": False, "restart_limit": 0}}
+            )
+            try:
+                client.notify("test/crash", {})
+                # Keep the editor side of stdin open, just like Zed after a crash.
+                code = client.process.wait(timeout=10)
+                client.stderr.seek(0)
+                errors = client.stderr.read().decode()
+                self.assertNotIn("Fatal Python error", errors)
+                self.assertEqual(code, 1, errors)
+                self.assertIn("23", errors)
+            finally:
+                if client.process.poll() is None:
+                    client.process.kill()
+                    client.process.wait()
+                client.process.stdin.close()
+                client.process.stdout.close()
+                client.stderr.close()
+
+    def test_recovery_restores_unsaved_documents_and_stops_crash_loops(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            command = [
+                sys.executable,
+                str(Path(bridge.__file__)),
+                "--server",
+                sys.executable,
+                "--workspace",
+                str(root),
+                "--cache",
+                str(root / ".cache"),
+                "--",
+                str(Path(__file__).with_name("fake_server.py")),
+            ]
+            client = LspClient(command, root, {"zed_mojo": {"download_stdlib": False}})
+            try:
+                uri = client.open(root / "unsaved.mojo", "def main():\n    pass\n")
+                closed = client.open(root / "closed.mojo", "# close me\n")
+                client.notify("textDocument/didClose", {"textDocument": {"uri": closed}})
+                settings = {"settings": {"keep": "configuration"}}
+                client.notify("workspace/didChangeConfiguration", settings)
+                for version in (2, 3):
+                    client.sequence += 1
+                    ident = client.sequence
+                    bridge.write_message(
+                        client.process.stdin,
+                        {"jsonrpc": "2.0", "id": ident, "method": "test/hang", "params": {}},
+                    )
+                    client.notify("test/startProgress", {})
+                    client.notify("test/crash", {})
+                    text = f"# unsaved edit {version} 😀\ndef main():\n    pass\n"
+                    client.notify(
+                        "textDocument/didChange",
+                        {
+                            "textDocument": {"uri": uri, "version": version},
+                            "contentChanges": [{"text": text}],
+                        },
+                    )
+                    replies, ended = [], False
+                    while True:
+                        message = client.receive()
+                        if message.get("id") == ident:
+                            replies.append(message)
+                        if (
+                            message.get("method") == "$/progress"
+                            and message["params"]["value"]["kind"] == "end"
+                        ):
+                            ended = True
+                        if (
+                            message.get("method") == "window/logMessage"
+                            and "unsaved documents restored" in message["params"]["message"]
+                        ):
+                            break
+                    self.assertEqual(len(replies), 1)
+                    self.assertIn("error", replies[0])
+                    self.assertTrue(ended)
+                    state = client.request("test/state", {})
+                    self.assertEqual(state["configuration"], settings)
+                    self.assertEqual(set(state["documents"]), {uri})
+                    self.assertEqual(state["documents"][uri]["version"], version)
+                    self.assertEqual(state["documents"][uri]["text"], text)
+                    self.assertEqual(
+                        client.request("test/echo", {"healthy": True}), {"healthy": True}
+                    )
+                client.notify("test/crash", {})
+                self.assertEqual(client.process.wait(timeout=10), 1)
+                client.stderr.seek(0)
+                errors = client.stderr.read().decode()
+                self.assertIn("limit reached", errors)
+                self.assertNotIn("Fatal Python error", errors)
+            finally:
+                if client.process.poll() is None:
+                    client.process.kill()
+                    client.process.wait()
+                client.process.stdin.close()
+                client.process.stdout.close()
+                client.stderr.close()
+
     def test_native_fixes_requests_and_unsaved_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

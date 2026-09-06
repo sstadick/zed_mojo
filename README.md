@@ -70,6 +70,14 @@ You can override the language server command, arguments, and environment in Zed 
 
 If autocomplete does not appear, first verify that Zed can start the server, then check `zed: open log` for LSP startup errors. Repeated `mojo-lsp-server failed: server shut down` messages mean the server process exited and Zed is still draining stale requests; reload the window to restart it.
 
+### Native-server crashes
+
+The bridge automatically restarts a native Mojo server that exits unexpectedly after initialization, up to twice in a rolling minute. It restores open documents from Zed's latest buffers (including unsaved edits), replays workspace configuration, and ends interrupted progress indicators. In-flight requests are cancelled rather than replayed against potentially changed text; invoke the action again after recovery. Old-server responses cannot complete new-server requests.
+
+This restores service but does not fix the underlying native compiler/server crash. If the same document repeatedly crashes the server, recovery stops and logs the exit status; save a reproduction and restart the language server manually. Set `initialization_options.zed_mojo.restart_limit` to `0` to disable automatic recovery (allowed values: `0`–`5`, default `2`). Startup failures are not retried, and a restarted server must finish initializing within 15 seconds.
+
+The bridge's pipe reader avoids Python's buffered-stdin shutdown lock, so a native crash or ordinary shutdown should no longer cause the secondary `_enter_buffered_busy` Python abort.
+
 ### Standard-library navigation
 
 On first use, the extension detects the server's Mojo version and caches the matching `mojo/v<version>` tag from [`modular/modular`](https://github.com/modular/modular), using a sparse checkout of the standard library. It adds those sources to the language server's search paths so native go-to-definition works for stdlib functions, types, built-ins, and methods. Project definitions still come from the same Mojo language server. First startup includes the source download; later starts reuse the cache.
