@@ -22,11 +22,13 @@ import tempfile
 import threading
 import time
 import tokenize
+import uuid
 from urllib.parse import unquote, urlparse
 
 IDENTIFIER = r"[A-Za-z_][A-Za-z_0-9]*"
 UNKNOWN = re.compile(r"use of unknown declaration '(" + IDENTIFIER + r")'")
 IMPORT_HINT = re.compile(r"Add 'from ([A-Za-z_][\w.]*) import (" + IDENTIFIER + r")'")
+RECOVERY_TIMEOUT = 15
 SKIP_DIRS = {
     "target",
     "build",
@@ -41,6 +43,41 @@ SKIP_DIRS = {
 
 def log(message):
     print(f"[zed-mojo] {message}", file=sys.stderr, flush=True)
+
+
+class PipeReader:
+    """Chunked pipe reads without holding Python's buffered-stdio locks.
+
+    Zed can leave stdin open after the backend exits. A daemon reader must not
+    hold sys.stdin.buffer's lock when Python finalizes its standard streams.
+    The same reader is used for initialize and subsequent messages so any
+    read-ahead bytes are retained.
+    """
+
+    def __init__(self, fd):
+        self.fd = fd
+        self.buffer = bytearray()
+
+    def readline(self):
+        while True:
+            end = self.buffer.find(b"\n")
+            if end >= 0:
+                result = bytes(self.buffer[: end + 1])
+                del self.buffer[: end + 1]
+                return result
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                result = bytes(self.buffer)
+                self.buffer.clear()
+                return result
+            self.buffer.extend(chunk)
+
+    def read(self, size):
+        if self.buffer:
+            result = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            return result
+        return os.read(self.fd, size)
 
 
 def read_message(stream):
@@ -838,29 +875,87 @@ def prepare(server, args, workspace, cache, initialize):
     return command, index, environment
 
 
-def run_proxy(command, index, initialize, workspace, environment):
-    process = subprocess.Popen(
-        command,
-        cwd=workspace,
-        env=environment,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=sys.stderr,
-    )
+def run_proxy(command, index, initialize, workspace, environment, client_input):
+    config = (initialize.get("params", {}).get("initializationOptions") or {}).get("zed_mojo", {})
+    restart_limit = config.get("restart_limit", 2)
+    if type(restart_limit) is not int or not 0 <= restart_limit <= 5:
+        raise ValueError("zed_mojo.restart_limit must be an integer between 0 and 5")
     events = queue.Queue()
     documents, pending = {}, {}
+    language_ids, state_notifications = {}, []
+    client_requests = {initialize["id"]}
+    server_requests, progress_tokens = set(), set()
+    cancelled_actions = set()
+    jobs, restarts = {}, []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    stopped = threading.Event()
+    ended_by = None
+    shutdown_requested = False
+    initialized = False
+    generation = 0
+    recovery_id = None
+    recovery_deadline = None
 
-    def read_loop(label, stream):
+    def read_loop(label, epoch, stream):
         try:
-            while (message := read_message(stream)) is not None:
-                events.put((label, message))
+            while not stopped.is_set() and (message := read_message(stream)) is not None:
+                events.put((label, epoch, message))
         except (OSError, ValueError, EOFError) as error:
-            log(f"{label} transport: {error}")
+            if not stopped.is_set():
+                log(f"{label} transport: {error}")
         finally:
-            events.put((label, None))
+            events.put((label, epoch, None))
 
-    def finish_actions(message, request, snapshot):
+    def start_backend():
+        child = subprocess.Popen(
+            command,
+            cwd=workspace,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+        )
+        reader = threading.Thread(
+            target=read_loop,
+            args=("server", generation, PipeReader(child.stdout.fileno())),
+            daemon=True,
+        )
+        reader.start()
+        return child, reader
+
+    def stop_backend(child, reader):
+        try:
+            child.stdin.close()
+        except OSError:
+            pass
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.terminate()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        reader.join(timeout=1)
+        child.stdout.close()
+
+    def send_backend(message):
+        try:
+            write_message(process.stdin, message)
+        except OSError:
+            # Let the EOF handler perform recovery; preserve document updates
+            # and fail outstanding requests rather than silently losing them.
+            events.put(("server", generation, None))
+
+    def fail_request(ident, code, reason):
+        client_requests.discard(ident)
+        write_message(
+            sys.stdout.buffer,
+            {"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": reason}},
+        )
+
+    def finish_actions(epoch, token, message, request, snapshot):
         try:
             additions = import_actions(request, snapshot[1], index)
             result = message.get("result") or []
@@ -872,18 +967,80 @@ def run_proxy(command, index, initialize, workspace, environment):
             }
         except Exception as error:
             log(f"Import fixes unavailable: {error}")
-        events.put(("actions", (message, request["textDocument"]["uri"], snapshot[0])))
+        events.put(
+            ("actions", epoch, (token, message, request["textDocument"]["uri"], snapshot[0]))
+        )
 
-    threading.Thread(target=read_loop, args=("client", sys.stdin.buffer), daemon=True).start()
-    threading.Thread(target=read_loop, args=("server", process.stdout), daemon=True).start()
-    write_message(process.stdin, initialize)
+    process, server_reader = start_backend()
+    threading.Thread(target=read_loop, args=("client", None, client_input), daemon=True).start()
     try:
+        send_backend(initialize)
         while True:
-            source, message = events.get()
+            timeout = None
+            if recovery_deadline is not None:
+                timeout = recovery_deadline - time.monotonic()
+                if timeout <= 0:
+                    log("Native Mojo server timed out while reinitializing")
+                    ended_by = "server"
+                    break
+            try:
+                source, epoch, message = events.get(timeout=timeout)
+            except queue.Empty:
+                continue
+            if source != "client" and epoch != generation:
+                continue
             if message is None:
-                break
+                if source == "client" or shutdown_requested:
+                    ended_by = source
+                    break
+                stop_backend(process, server_reader)
+                log(
+                    f"Native Mojo language server exited unexpectedly (status {process.returncode})"
+                )
+                for ident in list(client_requests):
+                    fail_request(ident, -32802, "Native Mojo server exited; request cancelled")
+                for token in progress_tokens:
+                    write_message(
+                        sys.stdout.buffer,
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "$/progress",
+                            "params": {
+                                "token": token,
+                                "value": {"kind": "end", "message": "Mojo server exited"},
+                            },
+                        },
+                    )
+                progress_tokens.clear()
+                server_requests.clear()
+                pending.clear()
+                cancelled_actions.clear()
+                for job, _ in jobs.values():
+                    job.cancel()
+                jobs.clear()
+                now = time.monotonic()
+                restarts = [stamp for stamp in restarts if now - stamp < 60]
+                if not initialized or len(restarts) >= restart_limit:
+                    log(
+                        "Automatic restart unavailable or limit reached; restart the Mojo language server in Zed"
+                    )
+                    ended_by = "server"
+                    break
+                restarts.append(now)
+                generation += 1
+                recovery_id = "zed-mojo-restart-" + uuid.uuid4().hex
+                recovery_deadline = now + RECOVERY_TIMEOUT
+                log("Restarting native Mojo server and restoring unsaved documents")
+                process, server_reader = start_backend()
+                send_backend({**initialize, "id": recovery_id})
+                continue
             if source == "actions":
-                response, uri, version = message
+                token, response, uri, version = message
+                if jobs.get(response["id"], (None, None))[1] is not token:
+                    continue
+                jobs.pop(response["id"])
+                if response["id"] not in client_requests:
+                    continue
                 if documents.get(uri, (None,))[0] != version:
                     response = {
                         "jsonrpc": "2.0",
@@ -894,13 +1051,24 @@ def run_proxy(command, index, initialize, workspace, environment):
                         },
                     }
                 write_message(sys.stdout.buffer, response)
+                client_requests.discard(response["id"])
                 continue
             method, params = message.get("method"), message.get("params") or {}
             if source == "client":
+                if method is None:
+                    if message.get("id") in server_requests:
+                        server_requests.discard(message["id"])
+                        send_backend(message)
+                    continue
+                if "id" in message:
+                    client_requests.add(message["id"])
+                if method == "shutdown":
+                    shutdown_requested = True
                 document = params.get("textDocument", {})
                 uri = document.get("uri")
                 if method == "textDocument/didOpen":
                     documents[uri] = (document["version"], document["text"])
+                    language_ids[uri] = document.get("languageId", "mojo")
                 elif method == "textDocument/didChange" and uri in documents:
                     try:
                         documents[uri] = (
@@ -911,29 +1079,129 @@ def run_proxy(command, index, initialize, workspace, environment):
                         documents.pop(uri, None)
                 elif method == "textDocument/didClose":
                     documents.pop(uri, None)
+                    language_ids.pop(uri, None)
+                elif method in (
+                    "workspace/didChangeConfiguration",
+                    "workspace/didChangeWorkspaceFolders",
+                ):
+                    if method == "workspace/didChangeConfiguration":
+                        state_notifications = [
+                            item for item in state_notifications if item["method"] != method
+                        ]
+                    state_notifications.append(message)
                 elif method == "textDocument/codeAction" and uri in documents:
                     pending[message["id"]] = (params, documents[uri])
-                write_message(process.stdin, message)
+                elif method == "$/cancelRequest" and (
+                    params.get("id") in jobs or params.get("id") in pending
+                ):
+                    ident = params["id"]
+                    job = jobs.pop(ident, None)
+                    if job is not None:
+                        job[0].cancel()
+                        if ident in client_requests:
+                            fail_request(ident, -32800, "Import fix request cancelled")
+                    else:
+                        # Keep the native request outstanding until its response;
+                        # otherwise a reused client ID could match that late reply.
+                        cancelled_actions.add(ident)
+                if recovery_id is not None:
+                    if method == "shutdown":
+                        write_message(
+                            sys.stdout.buffer,
+                            {"jsonrpc": "2.0", "id": message["id"], "result": None},
+                        )
+                        client_requests.discard(message["id"])
+                    elif "id" in message:
+                        pending.pop(message["id"], None)
+                        fail_request(
+                            message["id"],
+                            -32802,
+                            "Native Mojo server is restarting; retry the request",
+                        )
+                else:
+                    send_backend(message)
                 if method == "exit":
                     break
             else:
+                if method is None and recovery_id is not None and message.get("id") == recovery_id:
+                    if "error" in message:
+                        log(f"Native Mojo server could not reinitialize: {message['error']}")
+                        ended_by = "server"
+                        break
+                    recovery_id = None
+                    recovery_deadline = None
+                    send_backend({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                    for notification in state_notifications:
+                        send_backend(notification)
+                    for uri, (version, contents) in documents.items():
+                        send_backend(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/didOpen",
+                                "params": {
+                                    "textDocument": {
+                                        "uri": uri,
+                                        "version": version,
+                                        "languageId": language_ids[uri],
+                                        "text": contents,
+                                    }
+                                },
+                            }
+                        )
+                    log("Native Mojo language server restarted; unsaved documents restored")
+                    write_message(
+                        sys.stdout.buffer,
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "window/logMessage",
+                            "params": {
+                                "type": 3,
+                                "message": "Mojo language server restarted; unsaved documents restored",
+                            },
+                        },
+                    )
+                    continue
+                if method is None:
+                    if message.get("id") not in client_requests:
+                        continue
+                    if message.get("id") == initialize["id"] and "error" not in message:
+                        initialized = True
+                elif "id" in message:
+                    server_requests.add(message["id"])
+                if method == "$/progress":
+                    if params.get("value", {}).get("kind") == "begin":
+                        progress_tokens.add(params["token"])
+                    elif params.get("value", {}).get("kind") == "end":
+                        progress_tokens.discard(params["token"])
                 request = pending.pop(message.get("id"), None) if method is None else None
-                if request and "error" not in message:
-                    pool.submit(finish_actions, message, *request)
+                if method is None and message.get("id") in cancelled_actions:
+                    cancelled_actions.discard(message["id"])
+                    fail_request(message["id"], -32800, "Import fix request cancelled")
+                elif request and "error" not in message:
+                    if (
+                        documents.get(request[0]["textDocument"]["uri"], (None,))[0]
+                        != request[1][0]
+                    ):
+                        fail_request(
+                            message["id"], -32801, "Document changed while computing import fixes"
+                        )
+                    else:
+                        token = object()
+                        jobs[message["id"]] = (
+                            pool.submit(finish_actions, generation, token, message, *request),
+                            token,
+                        )
                 else:
                     write_message(sys.stdout.buffer, message)
+                    if method is None:
+                        client_requests.discard(message["id"])
     finally:
+        stopped.set()
         pool.shutdown(wait=False, cancel_futures=True)
-        process.stdin.close()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+        stop_backend(process, server_reader)
+    if ended_by == "server" and not shutdown_requested:
+        return 1
+    return 0
 
 
 def main():
@@ -943,7 +1211,8 @@ def main():
     parser.add_argument("--cache", required=True)
     parser.add_argument("server_args", nargs=argparse.REMAINDER)
     options = parser.parse_args()
-    initialize = read_message(sys.stdin.buffer)
+    client_input = PipeReader(sys.stdin.fileno())
+    initialize = read_message(client_input)
     if not initialize:
         return
     args = options.server_args
@@ -953,12 +1222,12 @@ def main():
     command, index, environment = prepare(
         options.server, args, workspace, Path(options.cache), initialize
     )
-    run_proxy(command, index, initialize, workspace, environment)
+    return run_proxy(command, index, initialize, workspace, environment, client_input)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         log(str(error))
         sys.exit(1)
