@@ -20,7 +20,7 @@ This fork is maintained at [`sstadick/zed_mojo`](https://github.com/sstadick/zed
 
 ## Install locally in Zed
 
-Have Mojo, Python 3.10 or newer (`python3`), and Git available in the environment Zed uses. Python runs the bundled language-server bridge; it has no third-party dependencies. Git is used for the first stdlib source download.
+Have a working Mojo installation, Python 3.10 or newer (`python3`), and Git available on the development machine (the server for SSH projects). The extension automatically discovers the nearest project's `.pixi/envs/default` Mojo installation, falling back to `PATH`. No `.zed/settings.json` is required for this setup. Python runs the bundled language-server bridge; it has no third-party dependencies. Git is used for the first stdlib source download.
 
 1. Open Zed.
 2. Run `zed: extensions` from the command palette.
@@ -36,11 +36,25 @@ If the extension does not appear immediately, reload Zed with `zed: reload windo
 
 This extension registers `mojo-lsp-server` as the default language server for Mojo files. Completion, diagnostics, go-to-definition, hover, and other semantic features come from that LSP server.
 
-The server is launched through the `PATH` inherited by Zed; the extension does not pin a machine-specific executable path.
+By default the extension searches the worktree and its parent directories for `.pixi/envs/default/bin/mojo-lsp-server`, then falls back to the worktree's `PATH`. This also works when opening a subdirectory or single file. The project environment takes precedence over a global installation. The bridge automatically supplies project and compiler import paths and downloads matching stdlib sources; activating Pixi or configuring project settings is unnecessary.
 
-No default diagnostic flags are passed to the server. The bridge adds source and package search paths with `-I`, and preserves your `binary.arguments` and `binary.env`. If you want `mojo-lsp-server` to additionally parse and type-check code blocks inside docstrings, pass `--check-docstrings` under `binary.arguments`. That check is off by default.
+For a new stable Mojo project, follow the [Mojo installation guide](https://mojolang.org/install/):
 
-Before opening a `.mojo` file, make sure the executable is visible from the environment that launches Zed:
+```sh
+pixi init my-project -c https://conda.modular.com/max/ -c conda-forge
+cd my-project
+pixi add mojo
+```
+
+Open that project in Zed and open a `.mojo` file. For SSH development, create/install the project on the server; keep the dev extension checkout and Rust build tools on the local computer. Python 3.10+ and Git must be available on the server. No machine-specific paths, Pixi activation, or `.zed` directory are needed. Different projects select their own installed compiler; matching stdlib sources are cached once per compiler release.
+
+For existing projects, run `pixi install` first. Discovery does not install or change your project's dependencies. Non-default Pixi environments and installations outside `.pixi/envs/default` use `PATH` or the optional override below. Nightly/custom compilers without a matching public release tag need matching sources supplied explicitly; offline first use also needs a pre-populated source cache or source override.
+
+After rebuilding a dev extension, wait for Zed to upload it to the SSH server, then run `editor: restart language server` with a Mojo file focused if the server has stopped. This is a dev-extension reload step, not per-project configuration.
+
+No default diagnostic flags are passed to the server. The bridge adds source and package search paths with `-I`, and preserves the native server's arguments and environment configured under `initialization_options.zed_mojo.server`. If you want `mojo-lsp-server` to additionally parse and type-check code blocks inside docstrings, pass `--check-docstrings` under that object's `arguments`. That check is off by default.
+
+For installations outside Pixi, make sure the executable is visible from the environment that launches Zed:
 
 ```sh
 which mojo-lsp-server
@@ -48,25 +62,32 @@ which mojo-lsp-server
 
 On Nix systems, launch Zed from a shell where `mojo-lsp-server` resolves successfully, or otherwise expose it through the environment used by Zed.
 
-### Configuring the language server
+### Optional language-server overrides
 
-You can override the language server command, arguments, and environment in Zed settings. This is useful when Mojo imports require extra search paths via `-I`:
+Normal Pixi projects need no settings. For a custom installation or additional arguments, configure the native Mojo server under `initialization_options.zed_mojo.server`. This selects an explicit executable without bypassing the extension's Python bridge:
 
 ```json
 {
   "lsp": {
     "mojo-lsp-server": {
-      "binary": {
-        "path": "mojo-lsp-server",
-        "arguments": ["-I", "/path/to/mojo/packages"],
-        "env": {}
+      "initialization_options": {
+        "zed_mojo": {
+          "server": {
+            "path": "/path/to/project/.pixi/envs/default/bin/mojo-lsp-server",
+            "arguments": ["-I", "/path/to/project"],
+            "env": {}
+          }
+        }
       },
-      "initialization_options": {},
       "settings": {}
     }
   }
 }
 ```
+
+Omit `server.path` to use automatic project/PATH discovery. The bridge adds the selected installation's `lib/mojo` directory and downloads matching standard-library sources automatically.
+
+Do not use Zed's top-level `binary.path` or `binary.arguments` for these native-server options: `binary.path` bypasses the extension launcher entirely, and `binary.arguments` replaces the Python bridge's command-line arguments. Remove those overrides when migrating to the configuration above, then restart the language server. Setting `binary.path` to the native Mojo server intentionally disables the bridge's source download, import fixes, and crash protection.
 
 If autocomplete does not appear, first verify that Zed can start the server, then check `zed: open log` for LSP startup errors. Repeated `mojo-lsp-server failed: server shut down` messages mean the server process exited and Zed is still draining stale requests; reload the window to restart it.
 
@@ -118,7 +139,7 @@ These optional settings live under the existing language server's `initializatio
 }
 ```
 
-Omit `stdlib_path` to detect/download sources automatically; `download_stdlib` defaults to `true`. Relative paths resolve against the worktree. `import_paths` are added to both the server and import index. Restart the language server after changing these settings. To run the original server directly, set `initialization_options.zed_mojo.enabled` to `false`; this disables the added features and removes the Python requirement.
+Omit `stdlib_path` to detect/download sources automatically; `download_stdlib` defaults to `true`. Relative paths resolve against the discovered Pixi project root (otherwise the worktree). `import_paths` are added to both the server and import index. Restart the language server after changing these settings. To run the original server directly, set `initialization_options.zed_mojo.enabled` to `false`; this disables the added features and removes the Python requirement.
 
 ## Snippets
 
@@ -157,7 +178,8 @@ Run the native Rust checks:
 
 ```sh
 cargo fmt --check
-cargo check
+cargo check --locked
+cargo test --locked --lib
 ```
 
 Zed compiles Rust extensions to WebAssembly. To check that target locally, install it once and run the target check:
@@ -188,5 +210,14 @@ python3 -m unittest discover -s tests -v
 ```
 
 That test checks stdlib and local definitions, applies stdlib and compiled-package import fixes, and builds the resulting Mojo program. The bridge is embedded from `server/mojo_lsp.py` into the Rust extension; rebuild the extension after changing either file.
+
+The cold-cache zero-configuration integration test needs only a stable server executable, Git, and network access, with no activated environment or `MOJO_STDLIB_PATH`:
+
+```sh
+MOJO_LSP_SERVER=/path/to/project/.pixi/envs/default/bin/mojo-lsp-server \
+PYTHONPATH=tests python3 -m unittest test_bridge.ZeroConfigurationIntegrationTests -v
+```
+
+It downloads matching sources into an empty temporary cache, verifies stdlib and project definitions, completion, semantic tokens, error diagnostics, and compilation, then repeats after restarting to verify cache reuse. CI runs this test against a freshly installed Pixi Mojo 1.0.0 environment. Rust tests cover per-project discovery, nested folders/single files, spaces in paths, and `PATH` fallback.
 
 `extension.wasm` is a generated build artifact and is intentionally ignored by git.

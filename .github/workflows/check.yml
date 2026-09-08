@@ -17,13 +17,18 @@ jobs:
           targets: wasm32-wasip1,wasm32-wasip2
 
       - name: Check native target
-        run: cargo check
+        run: cargo check --locked
+
+      - name: Check Rust formatting and project discovery
+        run: |
+          cargo fmt --check
+          cargo test --locked --lib
 
       - name: Check Zed extension target
-        run: cargo check --target wasm32-wasip1
+        run: cargo check --locked --target wasm32-wasip1
 
       - name: Build current Zed extension target
-        run: cargo build --release --target wasm32-wasip2
+        run: cargo build --locked --release --target wasm32-wasip2
 
       - uses: actions/setup-python@v5
         with:
@@ -43,3 +48,30 @@ jobs:
 
       - name: Check runnables
         run: bash scripts/check-runnables.sh
+
+  zero-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.80.0
+          run-install: false
+          cache: false
+
+      - name: Create a fresh stable Mojo project
+        run: |
+          pixi init "$RUNNER_TEMP/mojo-project" -c https://conda.modular.com/max/ -c conda-forge
+          pixi add --manifest-path "$RUNNER_TEMP/mojo-project/pixi.toml" 'mojo==1.0.0'
+
+      - name: Test cold source download and warm restart without activation or Zed settings
+        env:
+          MOJO_LSP_SERVER: ${{ runner.temp }}/mojo-project/.pixi/envs/default/bin/mojo-lsp-server
+          PYTHONPATH: tests
+        run: python3 -m unittest test_bridge.ZeroConfigurationIntegrationTests -v
