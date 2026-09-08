@@ -385,6 +385,61 @@ class ActionTests(unittest.TestCase):
 
 
 class SetupTests(unittest.TestCase):
+    def test_no_settings_adds_project_compiler_and_downloaded_source_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            library = root / ".pixi/envs/default/lib/mojo"
+            library.mkdir(parents=True)
+            server = root / ".pixi/envs/default/bin/mojo-lsp-server"
+            sources = root / "cache/stdlib-1.0.0/mojo/stdlib"
+            sources.mkdir(parents=True)
+            with patch.object(bridge, "configured_import_paths", return_value=[]), patch.object(
+                bridge, "ensure_stdlib", return_value=sources
+            ) as download:
+                command, index, environment = bridge.prepare(
+                    str(server), [], root, root / "cache", {"params": {}}
+                )
+            download.assert_called_once()
+            self.assertEqual(download.call_args.args[1], {})
+            self.assertEqual(
+                command, [str(server), "-I", str(sources), "-I", str(root), "-I", str(library)]
+            )
+            self.assertIn(root, index.roots)
+            self.assertIn(library, index.roots)
+            self.assertEqual(environment["MODULAR_MOJO_MAX_IMPORT_PATH"], str(sources))
+
+    def test_default_download_uses_matching_release_and_reuses_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            cache = root / "cache"
+
+            def run(command, **kwargs):
+                if command[1:] == ["--mojo-version"]:
+                    return subprocess.CompletedProcess(command, 0, "Mojo 1.0.0\n", "")
+                if command[1] == "clone":
+                    self.assertIn("mojo/v1.0.0", command)
+                    self.assertIn("--sparse", command)
+                    (Path(command[-1]) / "mojo/stdlib/std").mkdir(parents=True)
+                    (Path(command[-1]) / "mojo/stdlib/std/__init__.mojo").touch()
+                else:
+                    self.assertEqual(command[3:5], ["sparse-checkout", "set"])
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(subprocess, "run", side_effect=run) as commands, patch.object(
+                bridge.shutil, "which", return_value="/usr/bin/git"
+            ):
+                sources = bridge.ensure_stdlib("mojo-lsp-server", {}, cache, [], root)
+                self.assertEqual(sources, cache / "stdlib-1.0.0/mojo/stdlib")
+                self.assertTrue((sources / "std/__init__.mojo").is_file())
+                commands.reset_mock()
+                self.assertEqual(
+                    bridge.ensure_stdlib("mojo-lsp-server", {}, cache, [], root), sources
+                )
+                commands.assert_called_once_with(
+                    ["mojo-lsp-server", "--mojo-version"],
+                    capture_output=True, text=True, timeout=10, check=True,
+                )
+
     def test_custom_sources_and_arguments_survive(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -490,10 +545,11 @@ class TransportTests(unittest.TestCase):
 
 
 class LspClient:
-    def __init__(self, command, root, options):
+    def __init__(self, command, root, options, *, timeout=45, env=None):
         self.stderr = tempfile.TemporaryFile()
+        self.timeout = timeout
         self.process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr, env=env
         )
         self.messages, self.diagnostics = queue.Queue(), {}
         self.sequence = 0
@@ -528,7 +584,7 @@ class LspClient:
         self.notify("initialized", {})
 
     def receive(self):
-        message = self.messages.get(timeout=45)
+        message = self.messages.get(timeout=self.timeout)
         if message is None:
             self.stderr.seek(0)
             raise AssertionError(self.stderr.read().decode())
@@ -910,6 +966,94 @@ class ProxyTests(unittest.TestCase):
                     self.assertEqual(actions[1]["title"], f"Import {symbol} from library")
             finally:
                 client.close()
+
+
+@unittest.skipUnless(
+    os.environ.get("MOJO_LSP_SERVER"),
+    "set MOJO_LSP_SERVER for the cold-cache, zero-configuration integration test",
+)
+class ZeroConfigurationIntegrationTests(unittest.TestCase):
+    def test_cold_start_and_restart_without_settings_or_activation(self):
+        server = Path(os.environ["MOJO_LSP_SERVER"]).resolve()
+        with tempfile.TemporaryDirectory(prefix="zed mojo fresh project ") as temporary:
+            root = Path(temporary).resolve()
+            cache = root / ".cache"
+            (root / "helpers.mojo").write_text(
+                'def greeting() -> String:\n    return "hello"\n'
+            )
+            text = (
+                "from std.testing import assert_equal\n"
+                "from helpers import greeting\n\n"
+                "def main() raises:\n"
+                "    var message: String = greeting()\n"
+                '    assert_equal(message, "hello")\n'
+            )
+            main = root / "main.mojo"
+            main.write_text(text)
+            environment = os.environ.copy()
+            # Do not inherit a developer's activated environment or source paths.
+            environment.update({
+                "MODULAR_HOME": str(root / "no-global-configuration"),
+                "MOJO_IMPORT_PATH": "",
+                "MODULAR_MOJO_MAX_IMPORT_PATH": "",
+            })
+            command = [
+                sys.executable, str(Path(bridge.__file__)),
+                "--server", str(server), "--workspace", str(root),
+                "--cache", str(cache), "--",
+            ]
+            self.assertFalse(cache.exists())
+            for cold in (True, False):
+                with self.subTest(cold_cache=cold):
+                    client = LspClient(command, root, {}, timeout=180, env=environment)
+                    try:
+                        uri = client.open(main, text)
+                        self.assertEqual(client.diagnostics[uri]["diagnostics"], [])
+                        for line, symbol, target in (
+                            (0, "assert_equal", "/std/testing/testing.mojo"),
+                            (4, "String", "/std/collections/string/string.mojo"),
+                            (4, "greeting", "/helpers.mojo"),
+                        ):
+                            locations = client.request("textDocument/definition", {
+                                "textDocument": {"uri": uri},
+                                "position": position(line, text.splitlines()[line].index(symbol)),
+                            })
+                            self.assertTrue(
+                                any(item["uri"].endswith(target) for item in (locations or [])),
+                                (symbol, locations),
+                            )
+                        completion = client.request("textDocument/completion", {
+                            "textDocument": {"uri": uri},
+                            "position": position(5, len("    assert_")),
+                            "context": {"triggerKind": 1},
+                        })
+                        items = completion.get("items", []) if isinstance(completion, dict) else completion
+                        self.assertTrue(any("assert_equal" in item["label"] for item in items))
+                        tokens = client.request("textDocument/semanticTokens/full", {
+                            "textDocument": {"uri": uri},
+                        })
+                        self.assertTrue(tokens["data"])
+                        broken = client.open(root / "broken.mojo", "def main():\n    missing_value()\n")
+                        self.assertTrue(any(
+                            "missing_value" in item["message"]
+                            for item in client.diagnostics[broken]["diagnostics"]
+                        ))
+                        self.assertTrue(list(cache.glob("stdlib-*/mojo/stdlib/std/__init__.mojo")))
+                        client.stderr.seek(0)
+                        log = client.stderr.read().decode()
+                        self.assertEqual("Downloading stdlib sources" in log, cold)
+                        self.assertNotIn("Stdlib source navigation unavailable", log)
+                        self.assertFalse((root / ".zed").exists())
+                    finally:
+                        client.close()
+            build = subprocess.run([
+                str(server.with_name("mojo")), "build", str(main),
+                "-I", str(root), "-I", str(server.parent.parent / "lib/mojo"),
+                # Compile without linking: Pixi activation is only needed for
+                # the executable's runtime/linker paths, not language features.
+                "--emit", "llvm", "-o", str(root / "smoke.ll"),
+            ], capture_output=True, text=True, timeout=90, env=environment)
+            self.assertEqual(build.returncode, 0, build.stderr)
 
 
 @unittest.skipUnless(
