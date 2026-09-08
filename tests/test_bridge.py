@@ -591,6 +591,43 @@ class LspClient:
 
 
 class ProxyTests(unittest.TestCase):
+    def test_native_progress_handshake_disabled_on_launch_and_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            command = [
+                sys.executable,
+                str(Path(bridge.__file__)),
+                "--server",
+                sys.executable,
+                "--workspace",
+                str(root),
+                "--cache",
+                str(root / ".cache"),
+                "--",
+                str(Path(__file__).with_name("fake_server.py")),
+            ]
+            options = {"zed_mojo": {"download_stdlib": False}}
+            client = LspClient(command, root, options)
+            try:
+                params = client.request("test/initializeParams", {})
+                self.assertIs(params["capabilities"]["window"]["workDoneProgress"], False)
+                self.assertTrue(
+                    params["capabilities"]["textDocument"]["definition"]["linkSupport"]
+                )
+                self.assertEqual(params["initializationOptions"], options)
+                self.assertEqual(params["rootUri"], root.as_uri())
+                client.notify("test/crash", {})
+                while True:
+                    message = client.receive()
+                    if (
+                        message.get("method") == "window/logMessage"
+                        and "unsaved documents restored" in message["params"]["message"]
+                    ):
+                        break
+                self.assertEqual(client.request("test/initializeParams", {}), params)
+            finally:
+                client.close()
+
     def test_cancelled_worker_cannot_reply_to_reused_request_id(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -880,6 +917,23 @@ class ProxyTests(unittest.TestCase):
     "set MOJO_LSP_SERVER and MOJO_STDLIB_PATH for real-server integration tests",
 )
 class IntegrationTests(unittest.TestCase):
+    def test_progress_race_reproducer_through_bridge(self):
+        script = Path(__file__).resolve().parents[1] / "scripts/repro-lsp-progress-race.py"
+        for use_sources in (False, True):
+            with self.subTest(stdlib_sources=use_sources):
+                command = [
+                    sys.executable,
+                    str(script),
+                    "--bridge",
+                    "--server",
+                    os.environ["MOJO_LSP_SERVER"],
+                ]
+                if use_sources:
+                    command.extend(["--stdlib-path", os.environ["MOJO_STDLIB_PATH"]])
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("PASS: hover returned", result.stdout)
+
     def test_navigation_and_import_fixes_with_real_compiler(self):
         server = Path(os.environ["MOJO_LSP_SERVER"]).resolve()
         compiler = server.with_name("mojo")

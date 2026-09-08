@@ -10,6 +10,7 @@ waiting = None
 documents = {}
 configuration = None
 restart_marker = None
+initialize_params = None
 while (message := read_message(sys.stdin.buffer)) is not None:
     method = message.get("method")
     if method == "exit":
@@ -60,6 +61,7 @@ while (message := read_message(sys.stdin.buffer)) is not None:
     if "id" not in message:
         continue
     if method == "initialize":
+        initialize_params = message["params"]
         marker = message["params"].get("initializationOptions", {}).get("test_restart_marker")
         if marker:
             restart_marker = Path(marker)
@@ -78,6 +80,8 @@ while (message := read_message(sys.stdin.buffer)) is not None:
             result[0]["data"]["marker"] = message["params"]["testMarker"]
     elif method == "test/state":
         result = {"documents": documents, "configuration": configuration}
+    elif method == "test/initializeParams":
+        result = initialize_params
     elif method == "test/hang":
         continue
     elif method == "test/serverRequest":
