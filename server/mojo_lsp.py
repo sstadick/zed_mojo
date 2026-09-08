@@ -875,7 +875,29 @@ def prepare(server, args, workspace, cache, initialize):
     return command, index, environment
 
 
+def backend_initialize(initialize):
+    # Mojo's progress callback defers parsing until the client acknowledges
+    # window/workDoneProgress/create, but releases the document's task chain
+    # immediately. Hover/definition can then dereference a null parser context.
+    # Disable that optional handshake so parsing stays inside its queued task.
+    # Keep the client's message intact and use this on initial launch AND restart.
+    params = initialize.get("params") or {}
+    capabilities = params.get("capabilities") or {}
+    window = capabilities.get("window") or {}
+    return {
+        **initialize,
+        "params": {
+            **params,
+            "capabilities": {
+                **capabilities,
+                "window": {**window, "workDoneProgress": False},
+            },
+        },
+    }
+
+
 def run_proxy(command, index, initialize, workspace, environment, client_input):
+    initialize = backend_initialize(initialize)
     config = (initialize.get("params", {}).get("initializationOptions") or {}).get("zed_mojo", {})
     restart_limit = config.get("restart_limit", 2)
     if type(restart_limit) is not int or not 0 <= restart_limit <= 5:

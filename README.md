@@ -72,9 +72,11 @@ If autocomplete does not appear, first verify that Zed can start the server, the
 
 ### Native-server crashes
 
+The bridge disables the native server's optional work-progress handshake to prevent a reproduced Mojo 1.0.0 crash. The server can release its parse task while waiting for Zed to acknowledge `window/workDoneProgress/create`; hover or go-to-definition can then access an uninitialized parser context and segfault. This is a timing race, which can look like a random crash after editing. Disabling that capability keeps parsing in the document's task queue. Native parsing progress indicators are suppressed; semantic features remain available. See [the investigation and reproducer](docs/lsp-progress-race.md).
+
 The bridge automatically restarts a native Mojo server that exits unexpectedly after initialization, up to twice in a rolling minute. It restores open documents from Zed's latest buffers (including unsaved edits), replays workspace configuration, and ends interrupted progress indicators. In-flight requests are cancelled rather than replayed against potentially changed text; invoke the action again after recovery. Old-server responses cannot complete new-server requests.
 
-This restores service but does not fix the underlying native compiler/server crash. If the same document repeatedly crashes the server, recovery stops and logs the exit status; save a reproduction and restart the language server manually. Set `initialization_options.zed_mojo.restart_limit` to `0` to disable automatic recovery (allowed values: `0`–`5`, default `2`). Startup failures are not retried, and a restarted server must finish initializing within 15 seconds.
+Recovery covers other native compiler/server crashes; it does not repair those bugs. If the same document repeatedly crashes the server, recovery stops and logs the exit status; save a reproduction and restart the language server manually. Set `initialization_options.zed_mojo.restart_limit` to `0` to disable automatic recovery (allowed values: `0`–`5`, default `2`). Startup failures are not retried, and a restarted server must finish initializing within 15 seconds.
 
 The bridge's pipe reader avoids Python's buffered-stdin shutdown lock, so a native crash or ordinary shutdown should no longer cause the secondary `_enter_buffered_busy` Python abort.
 
